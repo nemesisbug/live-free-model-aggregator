@@ -8,8 +8,11 @@
 //
 // Routing, in one line: rank every free model that meets the prompt's requirements by the
 // brief's rating_milli, minus a penalty per refusal from that model, so a model that just
-// said no is tried last. The best candidate serves every prompt it can: there is no sealed
-// per-model budget to save for, only OpenRouter's real limits (20 free requests a minute,
+// said no is tried last. When two candidates tie on that score, the one called fewer times
+// in this trial goes first: the trial spreads its calls across the free models instead of
+// hammering the single best one into a 429, and a model that has already answered keeps its
+// place in line behind one that has not. The best candidate serves every prompt it can: there
+// is no sealed per-model budget to save for, only OpenRouter's real limits (20 free requests a minute,
 // 50 a day under 10 purchased credits, 1,000 a day at 10 or more), and the trial holds six
 // prompts. A refusal is handled by its kind: a 429 rate limit fails over at once to the
 // next best (it will not clear inside the prompt's 30 seconds), a 5xx or a broken call is
@@ -79,6 +82,17 @@ let manifestIndex = 0;
 /** Refusals from each model so far, by dialled id. */
 const failuresByModel = new Map<string, number>();
 
+/** Gateway attempts per model so far in this trial, by dialled id. */
+const callsByModel = new Map<string, number>();
+
+/**
+ * How many times this model has been dialled so far in this trial. The count is the
+ * load-balancing tie-break in candidatesFor: a model called fewer times goes first.
+ */
+function callsOf(modelId: string): number {
+  return callsByModel.get(modelId) ?? 0;
+}
+
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
@@ -105,23 +119,28 @@ interface Candidate {
   model: ModelRow;
   rating: number;
   score: number;
+  calls: number;
 }
 
 /**
  * Every free model that can serve these requirements, best first: the brief's rating, minus a
- * penalty per refusal from that model. Ties break on the rating, then on the id, so the order is
- * a pure function of the brief and the gateway's answers so far.
+ * penalty per refusal from that model. Ties break first on the rating, then on how many times
+ * the model has already been called in this trial — the less-called model goes first, so a
+ * trial spreads its calls instead of hammering one free model into a 429 — and last on the id.
+ * The order stays a pure function of the brief and the gateway's answers so far: no clock, no
+ * randomness, so a replay of the trial's cassette takes the same decisions.
  */
 function candidatesFor(requires: Requirement): Candidate[] {
   const out: Candidate[] = [];
   for (const model of freeModels(brief)) {
     if (!meetsRequirements(requires, capabilitiesOf(model))) continue;
     const rating = model.rating_milli;
-    out.push({ model, rating, score: rating - FAIL_PENALTY * failuresOf(model.id) });
+    out.push({ model, rating, score: rating - FAIL_PENALTY * failuresOf(model.id), calls: callsOf(model.id) });
   }
   out.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     if (b.rating !== a.rating) return b.rating - a.rating;
+    if (a.calls !== b.calls) return a.calls - b.calls;
     return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
   });
   return out;
@@ -213,6 +232,9 @@ function errorCodeOf(text: string, status: number): string {
 
 /** POST one request to the gateway's Chat Completions route, naming the model this entry dialled. */
 async function dial(model: string, body: Json): Promise<Response> {
+  // Every gateway attempt counts, answered or refused: the count is the load-balancing
+  // tie-break, and it is read before the call so the model being dialled counts too.
+  callsByModel.set(model, callsOf(model) + 1);
   const upstream: Json = { ...body, model };
   if (typeof upstream.max_tokens !== 'number' && typeof upstream.max_completion_tokens !== 'number') {
     upstream.max_tokens = DEFAULT_MAX_TOKENS;
