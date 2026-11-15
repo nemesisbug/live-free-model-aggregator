@@ -45,8 +45,8 @@ Chat Completions route) and a runner that drives a full practice trial with the
 kit's real env and scorer:
 
 ```sh
-test/run-practice.sh trial-0 clean      # all gateway calls succeed
-test/run-practice.sh trial-0 failover   # inkling 429s once, super-vl 500s once
+bash test/run-practice.sh trial-0 clean      # all gateway calls succeed
+bash test/run-practice.sh trial-0 failover   # inkling 429s once, super-vl 500s once
 ```
 
 ## License
